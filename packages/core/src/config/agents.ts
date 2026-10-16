@@ -12,7 +12,7 @@ import type { AgentRole } from '../types/agents.js';
  * `use: claude` in bugpatrol.yml expands to the preset for that role. A
  * `command` wins over the preset, for teams that need extra flags.
  */
-export const CLI_AGENTS = ['claude', 'codex', 'kimi', 'pi'] as const;
+export const CLI_AGENTS = ['claude', 'codex', 'kimi', 'opencode', 'pi'] as const;
 export type CliAgent = (typeof CLI_AGENTS)[number];
 
 const PRESETS: Record<CliAgent, { tools: string; fixer: string }> = {
@@ -32,6 +32,13 @@ const PRESETS: Record<CliAgent, { tools: string; fixer: string }> = {
   kimi: {
     tools: `kimi --quiet --mcp-config '{"mcpServers":{"bugpatrol":{"url":"'{mcpUrl}'"}}}'`,
     fixer: 'kimi --quiet --yolo',
+  },
+  // opencode 1.x (`opencode-ai`). The inline config denies every tool but the
+  // Bugpatrol ones, and `--pure` keeps plugins out. 2.x is refused before the
+  // run (packages/agents/src/runtime/opencode.ts).
+  opencode: {
+    tools: `OPENCODE_CONFIG_CONTENT='{"mcp":{"bugpatrol":{"type":"remote","url":"'{mcpUrl}'","oauth":false}},"permission":{"*":"deny","bugpatrol_*":"allow"}}' opencode run --pure --auto --format json`,
+    fixer: 'opencode run --auto --format json',
   },
   // pi has no MCP of its own: `--mcp-config` comes from the pi-mcp-adapter
   // extension (`pi install npm:pi-mcp-adapter`).

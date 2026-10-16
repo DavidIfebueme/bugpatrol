@@ -6,6 +6,7 @@ import { addUsage, formatUsage, type RoleRuntime, type TokenUsage, usageFrom } f
 import { serveTools } from '../mcp-server.js';
 import type { EventSink, RoleOutcome, RoleTask, Runtime } from '../types.js';
 import { firstLine } from './model.js';
+import { commandProgram, isOpencode } from './program.js';
 
 type CliUse = Extract<RoleRuntime, { runtime: 'cli' }>;
 
@@ -13,35 +14,97 @@ function quote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-type Parsed = { text: string; tokens?: TokenUsage; model?: string };
+type Parsed = { text: string; tokens?: TokenUsage; model?: string; error?: string };
+
+/** Which CLI wrote the stream, when known. Only opencode gets its events parsed. */
+export type CliFlavor = 'opencode' | undefined;
+
+function startsLikeJson(line: string): boolean {
+  return line.trimStart().startsWith('{');
+}
 
 /**
  * One line of CLI output, as text for the activity feed. A JSON event line
  * (`codex exec --json`) becomes its message text, or nothing.
  */
 function displayLine(line: string): string {
-  if (!line.trimStart().startsWith('{')) return line;
+  if (!startsLikeJson(line)) return line;
   try {
-    const event = JSON.parse(line) as { type?: string; item?: { type?: string; text?: string } };
+    const event = JSON.parse(line) as {
+      type?: string;
+      item?: { type?: string; text?: string };
+      part?: { type?: string; text?: string };
+    };
     if (
       event.type === 'item.completed' &&
       typeof event.item?.text === 'string' &&
       ['agent_message', 'reasoning'].includes(event.item.type ?? '')
     )
       return event.item.text;
+    if (event.type === 'text' && typeof event.part?.text === 'string')
+      return event.part.text.replace(/<thinking>[\s\S]*?(<\/thinking>|$)/g, '').trim();
     return '';
   } catch {
     return line;
   }
 }
 
+function parseStructuredEvents(lines: string[]): Parsed {
+  const text: string[] = [];
+  const errors: string[] = [];
+  let tokens: TokenUsage | undefined;
+  let costUsd = 0;
+  for (const line of lines) {
+    if (startsLikeJson(line)) {
+      try {
+        const event = JSON.parse(line) as {
+          type?: string;
+          part?: {
+            type?: string;
+            text?: string;
+            tokens?: { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
+            cost?: number;
+          };
+          error?: { name?: string; message?: string; data?: { message?: string } };
+        };
+        if (event.type === 'text' && typeof event.part?.text === 'string') {
+          const cleaned = event.part.text.replace(/<thinking>[\s\S]*?(<\/thinking>|$)/g, '').trim();
+          if (cleaned) text.push(cleaned);
+        } else if (event.type === 'step_finish' && event.part?.tokens) {
+          const t = event.part.tokens;
+          tokens = addUsage(tokens, {
+            input: t.input ?? 0,
+            output: (t.output ?? 0) + (t.reasoning ?? 0),
+            cacheRead: t.cache?.read ?? 0,
+            cacheWrite: t.cache?.write ?? 0,
+          });
+          costUsd += event.part.cost ?? 0;
+        } else if (event.type === 'error' && event.error) {
+          const message = event.error.message ?? event.error.data?.message ?? event.error.name;
+          if (message) errors.push(message);
+        }
+        continue;
+      } catch {
+        /* a text line that starts with a brace */
+      }
+    }
+    const shown = displayLine(line);
+    if (shown) text.push(shown);
+  }
+  if (tokens && costUsd) tokens.listCostUsd = costUsd;
+  const joined = text.join('\n');
+  const cause = errors.join('\n');
+  return { text: joined, tokens, ...(cause ? { error: cause } : {}) };
+}
+
 /**
  * What a CLI printed: the text, and the token usage when the CLI reports it.
  * `claude -p --output-format json` prints one JSON object with the result and
  * its usage. `codex exec --json` prints one event on each line, with the usage
- * on each `turn.completed`. Plain text has no usage.
+ * on each `turn.completed`. `opencode run --format json` prints one event on
+ * each line, with the text on each `text` event. Plain text has no usage.
  */
-export function parseCliOutput(stdout: string): Parsed {
+export function parseCliOutput(stdout: string, flavor: CliFlavor): Parsed {
   const trimmed = stdout.trim();
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     try {
@@ -67,8 +130,10 @@ export function parseCliOutput(stdout: string): Parsed {
   let tokens: TokenUsage | undefined;
   let events = 0;
   const text: string[] = [];
-  for (const line of trimmed.split('\n')) {
-    if (line.trimStart().startsWith('{')) {
+  const lines = trimmed.split('\n');
+  if (flavor === 'opencode') return parseStructuredEvents(lines);
+  for (const line of lines) {
+    if (startsLikeJson(line)) {
       try {
         const event = JSON.parse(line) as { type?: string; usage?: unknown };
         events++;
@@ -86,9 +151,12 @@ export function parseCliOutput(stdout: string): Parsed {
 /** A CLI gets the same tools over local MCP and a prompt on stdin and disk. */
 export class CliRuntime implements Runtime {
   readonly label: string;
+  private readonly flavor: CliFlavor;
 
   constructor(private readonly use: CliUse) {
-    this.label = `cli:${use.command.split(/\s+/)[0] ?? 'shell'}`;
+    const program = commandProgram(use.command);
+    this.label = `cli:${program ?? 'shell'}`;
+    this.flavor = program && isOpencode(program) ? 'opencode' : undefined;
   }
 
   async run(task: RoleTask, emit: EventSink): Promise<RoleOutcome> {
@@ -209,7 +277,7 @@ export class CliRuntime implements Runtime {
       if (pending.trim()) {
         emit({ kind: 'thought', summary: pending.trim().slice(0, 300) });
       }
-      const parsed = parseCliOutput(stdout);
+      const parsed = parseCliOutput(stdout, this.flavor);
       if (parsed.tokens) {
         const model = parsed.model ?? this.label;
         emit({
@@ -237,8 +305,16 @@ export class CliRuntime implements Runtime {
           stop: 'error',
           steps,
           costUsd: 0,
-          error: inputError || stderr.trim().split('\n').slice(-20).join('\n') || text || `CLI exited ${code}`,
+          error:
+            inputError ||
+            parsed.error ||
+            stderr.trim().split('\n').slice(-20).join('\n') ||
+            text ||
+            `CLI exited ${code}`,
         };
+      }
+      if (parsed.error) {
+        return { stop: 'error', steps, costUsd: 0, error: parsed.error, summary: summary || text, finished };
       }
       return {
         stop: 'done',
